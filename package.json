@@ -1,0 +1,13 @@
+{
+  "name": "hh-youtube-scraper",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "scrape": "node scrape-channel.mjs"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "@pinecone-database/pinecone": "^7.1.0",
+    "youtube-transcript": "^1.3.0"
+  }
+}
