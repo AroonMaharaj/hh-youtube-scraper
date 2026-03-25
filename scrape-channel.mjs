@@ -35,7 +35,7 @@ const INDEX_NAME = 'mark-goone-kb';
 const NAMESPACE = 'youtube';
 const CHUNK_SIZE = 1500;
 const CHUNK_OVERLAP = 200;
-const SHORT_VIDEO_THRESHOLD_SEC = 120;
+const SHORT_VIDEO_THRESHOLD_SEC = 300; // 5 min — skip all shorts and short clips
 const DRY_RUN = process.argv.includes('--dry-run');
 
 // ── Clients ──────────────────────────────────────────────────────────────
@@ -349,8 +349,8 @@ async function main() {
     }
 
     // If duration was unknown, check transcript length to filter shorts
-    if (video.durationSec === 0 && transcript.length < 1500) {
-      console.log(`  SKIP — transcript too short (${transcript.length} chars, likely a short)`);
+    if (video.durationSec === 0 && transcript.length < 5000) {
+      console.log(`  SKIP — transcript too short (${transcript.length} chars, likely a short/clip)`);
       skipped++;
       continue;
     }
