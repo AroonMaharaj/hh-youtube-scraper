@@ -11,6 +11,23 @@ import 'dotenv/config';
 import { Pinecone } from '@pinecone-database/pinecone';
 import { GoogleGenAI } from '@google/genai';
 import { fetchTranscript } from 'youtube-transcript/dist/youtube-transcript.esm.js';
+import { readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const blocklist = JSON.parse(readFileSync(join(__dirname, 'blocklist.json'), 'utf-8'));
+
+function isBlocked(title) {
+  const lower = title.toLowerCase();
+  for (const pattern of blocklist.blockedTitlePatterns) {
+    if (lower.includes(pattern.toLowerCase())) return true;
+  }
+  for (const blocked of blocklist.blockedTitles) {
+    if (lower.includes(blocked.toLowerCase())) return true;
+  }
+  return false;
+}
 
 // ── Config ───────────────────────────────────────────────────────────────
 const CHANNEL_HANDLE = '@hungryhorsepoker';
@@ -34,6 +51,23 @@ function parseDuration(text) {
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
   if (parts.length === 2) return parts[0] * 60 + parts[1];
   return parts[0] || 0;
+}
+
+/** Fetch the upload date from a YouTube video page */
+async function fetchUploadDate(videoId) {
+  try {
+    const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    });
+    const html = await res.text();
+    const match = html.match(/"dateText":\{"simpleText":"([^"]+)"\}/)
+      || html.match(/"publishDate":"([^"]+)"/)
+      || html.match(/"uploadDate":"([^"]+)"/)
+      || html.match(/<meta itemprop="datePublished" content="([^"]+)"/);
+    return match?.[1] || null;
+  } catch {
+    return null;
+  }
 }
 
 /** Scrape the channel /videos page for video metadata */
@@ -210,6 +244,7 @@ async function upsertVideo(video, chunks, embeddings) {
         videoId: video.id,
         title: video.title,
         duration: video.duration,
+        uploadDate: video.uploadDate || '',
         chunkIndex: i,
         totalChunks: chunks.length,
         text: chunks[i].slice(0, 3600),
@@ -226,6 +261,7 @@ async function upsertVideo(video, chunks, embeddings) {
       videoId: video.id,
       title: video.title,
       duration: video.duration,
+      uploadDate: video.uploadDate || '',
       isManifest: true,
       totalChunks: chunks.length,
       source: 'youtube',
@@ -281,10 +317,11 @@ async function main() {
   }
 
   // Filter to long-form only (skip videos under threshold, but keep unknown-duration from RSS)
+  // Also filter out blocked videos (vlog episodes, collabs, non-strategy content)
   const allVideos = [...videoMap.values()].filter(
-    (v) => v.durationSec === 0 || v.durationSec >= SHORT_VIDEO_THRESHOLD_SEC
+    (v) => (v.durationSec === 0 || v.durationSec >= SHORT_VIDEO_THRESHOLD_SEC) && !isBlocked(v.title)
   );
-  console.log(`Total unique long-form candidates: ${allVideos.length}`);
+  console.log(`Total unique long-form candidates: ${allVideos.length} (after blocklist filter)`);
 
   // 3. Filter out already-scraped
   const newVideos = allVideos.filter((v) => !existingIds.has(v.id));
@@ -327,6 +364,20 @@ async function main() {
       } catch {
         video.title = video.id;
       }
+    }
+
+    // Check blocklist after title is resolved
+    if (isBlocked(video.title)) {
+      console.log(`  SKIP — blocked by blocklist: "${video.title}"`);
+      skipped++;
+      continue;
+    }
+
+    // Fetch upload date
+    const uploadDate = await fetchUploadDate(video.id);
+    if (uploadDate) {
+      video.uploadDate = uploadDate;
+      console.log(`  Upload date: ${uploadDate}`);
     }
 
     console.log(`  Transcript: ${transcript.length} chars`);
