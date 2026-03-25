@@ -11,6 +11,7 @@ import 'dotenv/config';
 import { Pinecone } from '@pinecone-database/pinecone';
 import { GoogleGenAI } from '@google/genai';
 import { fetchTranscript } from 'youtube-transcript/dist/youtube-transcript.esm.js';
+import { Innertube } from 'youtubei.js';
 import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -70,67 +71,37 @@ async function fetchUploadDate(videoId) {
   }
 }
 
-/** Scrape the channel /videos page for video metadata */
-async function scrapeChannelPage() {
-  console.log(`Fetching ${CHANNEL_HANDLE}/videos ...`);
-  const res = await fetch(`https://www.youtube.com/${CHANNEL_HANDLE}/videos`, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-  });
-  const html = await res.text();
-  const videos = [];
+/** Fetch ALL videos from the channel using youtubei.js (paginates fully) */
+async function getAllChannelVideos() {
+  console.log(`Fetching all videos from ${CHANNEL_HANDLE} via youtubei.js ...`);
+  const yt = await Innertube.create({ lang: 'en', location: 'US' });
+  const resolved = await yt.resolveURL(`https://www.youtube.com/${CHANNEL_HANDLE}`);
+  const channel = await yt.getChannel(resolved.payload.browseId);
+  let videosTab = await channel.getVideos();
 
-  const dataMatch = html.match(/var ytInitialData = ({.*?});\s*<\/script>/s);
-  if (dataMatch) {
-    try {
-      const data = JSON.parse(dataMatch[1]);
-      const tabs = data?.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
-      for (const tab of tabs) {
-        const contents = tab?.tabRenderer?.content?.richGridRenderer?.contents || [];
-        for (const item of contents) {
-          const video = item?.richItemRenderer?.content?.videoRenderer;
-          if (video?.videoId) {
-            videos.push({
-              id: video.videoId,
-              title: video.title?.runs?.[0]?.text || 'Untitled',
-              duration: video.lengthText?.simpleText || '',
-              durationSec: parseDuration(video.lengthText?.simpleText || ''),
-            });
-          }
-        }
-      }
-    } catch (e) {
-      console.error('Failed to parse ytInitialData:', e.message);
+  const videos = [];
+  let page = 0;
+
+  while (true) {
+    page++;
+    const items = videosTab.videos || [];
+    for (const v of items) {
+      if (!v.id) continue;
+      const durText = v.duration?.text || '';
+      videos.push({
+        id: v.id,
+        title: v.title?.text || v.title?.toString() || '',
+        duration: durText,
+        durationSec: parseDuration(durText),
+      });
     }
+    console.log(`  Page ${page}: ${items.length} videos (${videos.length} total)`);
+
+    if (!videosTab.has_continuation) break;
+    videosTab = await videosTab.getContinuation();
   }
 
   return videos;
-}
-
-/** Get channel ID for RSS feed */
-async function getChannelId() {
-  const res = await fetch(`https://www.youtube.com/${CHANNEL_HANDLE}`, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-  });
-  const html = await res.text();
-  const match = html.match(/"channelId":"([a-zA-Z0-9_-]+)"/) ||
-                html.match(/"externalId":"([a-zA-Z0-9_-]+)"/);
-  return match?.[1] || null;
-}
-
-/** Get recent video IDs from RSS (catches new uploads between page scrapes) */
-async function getRSSVideoIds(channelId) {
-  const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`);
-  const xml = await res.text();
-  const ids = [];
-  const entries = xml.split('<entry>').slice(1);
-  for (const entry of entries) {
-    const idMatch = entry.match(/<yt:videoId>([^<]+)<\/yt:videoId>/);
-    if (idMatch) ids.push(idMatch[1]);
-  }
-  return ids;
 }
 
 // ── Pinecone Helpers ─────────────────────────────────────────────────────
@@ -299,29 +270,15 @@ async function main() {
   const existingIds = await getExistingVideoIds();
   console.log(`Already indexed: ${existingIds.size} videos`);
 
-  // 2. Fetch videos from channel page + RSS
-  const pageVideos = await scrapeChannelPage();
-  console.log(`Channel page: ${pageVideos.length} videos`);
+  // 2. Fetch ALL videos from the channel (full pagination)
+  const channelVideos = await getAllChannelVideos();
+  console.log(`Channel total: ${channelVideos.length} videos`);
 
-  const channelId = await getChannelId();
-  const rssIds = channelId ? await getRSSVideoIds(channelId) : [];
-  console.log(`RSS feed: ${rssIds.length} video IDs`);
-
-  // Merge: page videos (with metadata) + RSS-only IDs
-  const videoMap = new Map();
-  for (const v of pageVideos) videoMap.set(v.id, v);
-  for (const id of rssIds) {
-    if (!videoMap.has(id)) {
-      videoMap.set(id, { id, title: '', duration: '', durationSec: 0 });
-    }
-  }
-
-  // Filter to long-form only (skip videos under threshold, but keep unknown-duration from RSS)
-  // Also filter out blocked videos (vlog episodes, collabs, non-strategy content)
-  const allVideos = [...videoMap.values()].filter(
-    (v) => (v.durationSec === 0 || v.durationSec >= SHORT_VIDEO_THRESHOLD_SEC) && !isBlocked(v.title)
+  // Filter to long-form only + blocklist
+  const allVideos = channelVideos.filter(
+    (v) => v.durationSec >= SHORT_VIDEO_THRESHOLD_SEC && !isBlocked(v.title)
   );
-  console.log(`Total unique long-form candidates: ${allVideos.length} (after blocklist filter)`);
+  console.log(`Long-form candidates: ${allVideos.length} (after duration + blocklist filter)`);
 
   // 3. Filter out already-scraped
   const newVideos = allVideos.filter((v) => !existingIds.has(v.id));
